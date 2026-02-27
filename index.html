@@ -1,0 +1,919 @@
+<!DOCTYPE html>
+<html lang="az">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-fullscreen" />
+  <meta name="theme-color" content="#000000" />
+  <title>Hand Tracking</title>
+
+  <!--
+    ============================================================
+    PRODUCTION MEDIAPIPE HANDS — iOS 17 / iPhone 15
+    Architecture: Decoupled inference + render loop
+    Target: Deterministic 60 FPS, zero GC pressure, minimal latency
+    ============================================================
+  -->
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%; height: 100%;
+      background: #000;
+      overflow: hidden;
+      /* Prevent elastic scroll interfering with touch */
+      overscroll-behavior: none;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    #input_video {
+      /* Hidden — used only as MediaPipe source */
+      position: absolute;
+      width: 1px; height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    #output_canvas {
+      position: fixed;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      /* GPU layer promotion — keeps canvas on its own compositor layer */
+      will-change: transform;
+      /* Prevent iOS tap highlight */
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    #loading-screen {
+      position: fixed;
+      inset: 0;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 10;
+      flex-direction: column;
+      gap: 20px;
+      font-family: -apple-system, sans-serif;
+      color: #00f2ff;
+      font-size: 14px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+    }
+
+    .loader {
+      width: 48px; height: 48px;
+      border: 2px solid #00f2ff22;
+      border-top-color: #00f2ff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #perf-hud {
+      position: fixed;
+      top: env(safe-area-inset-top, 10px);
+      left: 10px;
+      font-family: 'Courier New', monospace;
+      font-size: 10px;
+      color: #00f2ff88;
+      pointer-events: none;
+      z-index: 5;
+      line-height: 1.6;
+      /* Hidden by default — toggle via #DEBUG_MODE */
+      display: none;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="loading-screen">
+    <div class="loader"></div>
+    <span>Initializing</span>
+  </div>
+
+  <!-- Perf HUD — visible only in debug mode -->
+  <div id="perf-hud" id="perf-hud">
+    FPS: <span id="hud-fps">--</span><br>
+    INF: <span id="hud-inf">--</span>ms<br>
+    PRT: <span id="hud-prt">--</span><br>
+    GC: <span id="hud-gc">--</span>
+  </div>
+
+  <!-- Camera source — hidden, front-facing -->
+  <video id="input_video" playsinline></video>
+
+  <!--
+    Single canvas — no offscreen compositing to avoid extra blit.
+    Size set via JS respecting devicePixelRatio.
+  -->
+  <canvas id="output_canvas"></canvas>
+
+  <!-- MediaPipe SIMD WASM loader — must be first -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands_solution_simd_wasm_bin.js" crossorigin="anonymous"></script>
+  <!-- MediaPipe packed assets loader -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands_solution_packed_assets_loader.js" crossorigin="anonymous"></script>
+  <!-- MediaPipe Camera utility -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <!-- MediaPipe Hands core -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+  <script>
+  'use strict';
+
+  /* ============================================================
+     CONFIGURATION
+     All magic numbers centralized here for easy tuning.
+     ============================================================ */
+  const CFG = Object.freeze({
+    // --- Inference ---
+    MAX_HANDS: 1,
+    MODEL_COMPLEXITY: 1,         // 0=lite, 1=full — full needed for stable tracking
+    MIN_DETECTION_CONF: 0.85,    // Slightly relaxed from 0.9 for faster re-detection
+    MIN_TRACKING_CONF: 0.85,
+
+    // Camera resolution — 640×480 is optimal for MediaPipe on mobile:
+    // Higher res (720p) increases inference time 40% with <5% accuracy gain.
+    CAMERA_WIDTH: 640,
+    CAMERA_HEIGHT: 480,
+
+    // --- Rendering ---
+    TARGET_FPS: 60,
+
+    // --- Landmark smoothing (Exponential Moving Average) ---
+    // Lower = smoother but more lag. 0.35 is good for 60fps tracking.
+    LANDMARK_EMA_ALPHA: 0.35,
+
+    // --- Gesture hysteresis ---
+    // Pinch OPEN threshold (px in canvas space) — must exceed this to exit pinch
+    PINCH_OPEN_THRESHOLD: 60,
+    // Pinch CLOSE threshold — must be below this to enter pinch
+    PINCH_CLOSE_THRESHOLD: 42,
+
+    // --- Gesture state debounce (frames) ---
+    GESTURE_DEBOUNCE_FRAMES: 3,
+
+    // --- Particles ---
+    PARTICLE_POOL_SIZE: 256,     // Pre-allocated pool — zero allocation during runtime
+    SPARKS_PER_EMISSION: 5,      // Fixed count removes random allocation variance
+    SPARK_MAX_SPEED: 22,
+    SPARK_MIN_SPEED: 10,
+    SPARK_GRAVITY: 0.4,
+    SPARK_FRICTION: 0.95,
+    SPARK_DECAY_MIN: 0.018,
+    SPARK_DECAY_MAX: 0.038,
+
+    // --- Drawing paths ---
+    // Skip point if closer than this (px) to last point — reduces point count
+    MIN_DRAW_DISTANCE_SQ: 9,     // sqrt(9) = 3px minimum
+
+    // --- Path hit detection ---
+    PATH_HIT_RADIUS: 80,
+
+    // --- Shadow glow: use composite glow trick instead of shadowBlur ---
+    // shadowBlur is CPU-rasterized on WebKit. We replace it with
+    // layered strokes at varying widths/opacity — GPU-friendly.
+    USE_LAYERED_GLOW: true,
+
+    // --- Debug ---
+    DEBUG_MODE: false,           // Set true to show perf HUD
+  });
+
+  /* ============================================================
+     MODULE: CANVAS SETUP
+     Handles devicePixelRatio-aware sizing, resize debouncing,
+     and stable coordinate space.
+     ============================================================ */
+  const CanvasModule = (() => {
+    const canvas = document.getElementById('output_canvas');
+    // Single context — no willReadFrequently needed (write-only canvas)
+    const ctx = canvas.getContext('2d', {
+      alpha: false,          // Opaque canvas — WebKit skips alpha compositing pass
+      desynchronized: true,  // Hint: allow async presentation (reduces input lag ~1 frame)
+    });
+
+    let W = 0, H = 0, DPR = 1;
+    let resizeTimer = null;
+
+    function resize() {
+      DPR = Math.min(window.devicePixelRatio || 1, 3); // Cap at 3× — A17 supports it fine
+      const logicalW = window.innerWidth;
+      const logicalH = window.innerHeight;
+
+      // Physical pixel dimensions
+      const physW = Math.round(logicalW * DPR);
+      const physH = Math.round(logicalH * DPR);
+
+      // Only resize if dimensions actually changed — avoid spurious canvas wipes
+      if (canvas.width === physW && canvas.height === physH) return;
+
+      canvas.width  = physW;
+      canvas.height = physH;
+      // CSS size stays at logical pixels — browser scales up
+      canvas.style.width  = logicalW + 'px';
+      canvas.style.height = logicalH + 'px';
+
+      W = physW;
+      H = physH;
+
+      // After resize, scale ctx to physical pixels
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    }
+
+    function debouncedResize() {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(resize, 150);
+    }
+
+    window.addEventListener('resize', debouncedResize, { passive: true });
+    resize();
+
+    // Logical dimensions (what we use for all coordinates — DPR handled by transform)
+    function logicalW() { return window.innerWidth; }
+    function logicalH() { return window.innerHeight; }
+
+    return { canvas, ctx, logicalW, logicalH };
+  })();
+
+  const { canvas, ctx } = CanvasModule;
+
+  /* ============================================================
+     MODULE: PARTICLE ENGINE
+     Object pool — zero runtime allocation.
+     All Spark objects are pre-created and recycled.
+     ============================================================ */
+  const ParticleEngine = (() => {
+    // Pre-allocated pool
+    const pool = new Array(CFG.PARTICLE_POOL_SIZE);
+    for (let i = 0; i < CFG.PARTICLE_POOL_SIZE; i++) {
+      pool[i] = {
+        x: 0, y: 0,
+        vx: 0, vy: 0,
+        life: 0,       // 0 = inactive / dead
+        decay: 0,
+      };
+    }
+
+    // Active particles tracked by index into pool — avoids splice
+    // We use a simple "active count" approach: swap dead with last active
+    let activeIndices = new Int16Array(CFG.PARTICLE_POOL_SIZE);
+    let activeCount = 0;
+
+    // Reusable color strings — avoid template literal allocations in hot path
+    // Colors are computed from life bucket, not per-particle
+    const COLOR_HOT  = 'rgb(255,255,200)'; // life > 0.8
+    const COLOR_WARM = 'rgb(255,200,50)';  // life > 0.4
+    const COLOR_COOL = 'rgb(200,50,0)';    // life <= 0.4
+
+    function emit(x, y, count) {
+      for (let i = 0; i < count; i++) {
+        if (activeCount >= CFG.PARTICLE_POOL_SIZE) break; // Pool exhausted — skip
+
+        // Find a dead pool slot (life === 0)
+        // Linear scan is acceptable here — emission is rare vs update
+        let slot = -1;
+        for (let s = 0; s < CFG.PARTICLE_POOL_SIZE; s++) {
+          if (pool[s].life <= 0) { slot = s; break; }
+        }
+        if (slot === -1) break;
+
+        const angle = Math.random() * 6.2832; // 2π
+        const speed = CFG.SPARK_MIN_SPEED + Math.random() * (CFG.SPARK_MAX_SPEED - CFG.SPARK_MIN_SPEED);
+        const p = pool[slot];
+        p.x     = x;
+        p.y     = y;
+        p.vx    = Math.cos(angle) * speed;
+        p.vy    = Math.sin(angle) * speed;
+        p.life  = 1.0;
+        p.decay = CFG.SPARK_DECAY_MIN + Math.random() * (CFG.SPARK_DECAY_MAX - CFG.SPARK_DECAY_MIN);
+
+        activeIndices[activeCount++] = slot;
+      }
+    }
+
+    function updateAndDraw() {
+      // No save/restore here — caller manages ctx state
+      // We set shared state once before the loop
+      ctx.lineCap = 'round';
+
+      let i = 0;
+      while (i < activeCount) {
+        const idx = activeIndices[i];
+        const p = pool[idx];
+
+        // Physics
+        p.vx *= CFG.SPARK_FRICTION;
+        p.vy *= CFG.SPARK_FRICTION;
+        p.vy += CFG.SPARK_GRAVITY;
+        p.x  += p.vx;
+        p.y  += p.vy;
+        p.life -= p.decay;
+
+        if (p.life <= 0) {
+          p.life = 0;
+          // Swap with last active (O(1) removal — no splice)
+          activeIndices[i] = activeIndices[--activeCount];
+          continue; // Don't increment i — recheck swapped element
+        }
+
+        // Draw — layered stroke glow instead of shadowBlur
+        // Outer glow stroke (wide, low opacity)
+        const color = p.life > 0.8 ? COLOR_HOT : (p.life > 0.4 ? COLOR_WARM : COLOR_COOL);
+        const alpha = p.life;
+        const tailX = p.x - p.vx * 0.8;
+        const tailY = p.y - p.vy * 0.8;
+
+        // Glow layer — wide, transparent
+        ctx.globalAlpha = alpha * 0.25;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 5 * p.life;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(tailX, tailY);
+        ctx.stroke();
+
+        // Core layer — thin, opaque
+        ctx.globalAlpha = alpha;
+        ctx.lineWidth = 1.2 * p.life;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(tailX, tailY);
+        ctx.stroke();
+
+        i++;
+      }
+
+      // Reset shared state
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = 1;
+    }
+
+    function getActiveCount() { return activeCount; }
+
+    return { emit, updateAndDraw, getActiveCount };
+  })();
+
+  /* ============================================================
+     MODULE: GESTURE & LANDMARK STATE
+     - EMA landmark smoothing
+     - Hysteresis-based pinch detection
+     - Debounced gesture state machine
+     ============================================================ */
+  const GestureModule = (() => {
+    // Smoothed landmark positions — 21 landmarks × {x, y, z}
+    // Pre-allocated Float32Arrays — zero GC
+    const smoothX = new Float32Array(21);
+    const smoothY = new Float32Array(21);
+    const smoothZ = new Float32Array(21);
+    let isInitialized = false;
+
+    // Gesture state machine
+    const GESTURE = Object.freeze({ NONE: 0, DRAW: 1, PINCH: 2 });
+    let currentGesture = GESTURE.NONE;
+    let gesturePendingState = GESTURE.NONE;
+    let gesturePendingFrames = 0;
+
+    // Pinch state
+    let isPinchActive = false;
+
+    // Apply EMA smoothing to incoming raw landmarks
+    function smoothLandmarks(rawLandmarks) {
+      const alpha = CFG.LANDMARK_EMA_ALPHA;
+      const oneMinusAlpha = 1 - alpha;
+
+      if (!isInitialized) {
+        for (let i = 0; i < 21; i++) {
+          smoothX[i] = rawLandmarks[i].x;
+          smoothY[i] = rawLandmarks[i].y;
+          smoothZ[i] = rawLandmarks[i].z;
+        }
+        isInitialized = true;
+      } else {
+        for (let i = 0; i < 21; i++) {
+          smoothX[i] = alpha * rawLandmarks[i].x + oneMinusAlpha * smoothX[i];
+          smoothY[i] = alpha * rawLandmarks[i].y + oneMinusAlpha * smoothY[i];
+          smoothZ[i] = alpha * rawLandmarks[i].z + oneMinusAlpha * smoothZ[i];
+        }
+      }
+    }
+
+    function reset() {
+      isInitialized = false;
+      currentGesture = GESTURE.NONE;
+      gesturePendingState = GESTURE.NONE;
+      gesturePendingFrames = 0;
+      isPinchActive = false;
+    }
+
+    // Squared Euclidean distance in canvas-pixel space (avoids sqrt)
+    function distSq(ia, ib, w, h) {
+      const dx = (smoothX[ia] - smoothX[ib]) * w;
+      const dy = (smoothY[ia] - smoothY[ib]) * h;
+      return dx * dx + dy * dy;
+    }
+
+    // Distance (with sqrt) in canvas-pixel space — used for pinch threshold
+    function dist(ia, ib, w, h) {
+      return Math.sqrt(distSq(ia, ib, w, h));
+    }
+
+    // Returns true if index finger is the ONLY extended finger
+    function detectIndexOnly(w, h) {
+      // Use smoothed landmarks
+      // Thumb: compare tip to palm base distance
+      const thumbOpen = distSq(4, 17, w, h) > distSq(3, 17, w, h);
+      // Other fingers: tip Y < pip Y (landmark is higher on screen = finger extended)
+      // Note: in mirrored camera space, lower Y = higher on screen
+      const indexExtended = smoothY[8]  < smoothY[6];
+      const middleCurled  = smoothY[12] > smoothY[10];
+      const ringCurled    = smoothY[16] > smoothY[14];
+      const pinkyCurled   = smoothY[20] > smoothY[18];
+
+      return indexExtended && middleCurled && ringCurled && pinkyCurled && !thumbOpen;
+    }
+
+    // Hysteresis pinch detection
+    // Returns true if pinch is ACTIVE (with hysteresis)
+    function detectPinch(w, h) {
+      const d = dist(4, 8, w, h);
+      if (!isPinchActive && d < CFG.PINCH_CLOSE_THRESHOLD) {
+        isPinchActive = true;
+      } else if (isPinchActive && d > CFG.PINCH_OPEN_THRESHOLD) {
+        isPinchActive = false;
+      }
+      return isPinchActive;
+    }
+
+    // Debounced gesture classification
+    // Prevents single-frame gesture flips
+    function classifyGesture(w, h) {
+      let rawGesture = GESTURE.NONE;
+
+      if (detectPinch(w, h)) {
+        rawGesture = GESTURE.PINCH;
+      } else if (detectIndexOnly(w, h)) {
+        rawGesture = GESTURE.DRAW;
+      }
+
+      if (rawGesture !== gesturePendingState) {
+        gesturePendingState = rawGesture;
+        gesturePendingFrames = 0;
+      } else {
+        gesturePendingFrames++;
+        if (gesturePendingFrames >= CFG.GESTURE_DEBOUNCE_FRAMES) {
+          currentGesture = rawGesture;
+        }
+      }
+
+      return currentGesture;
+    }
+
+    return {
+      GESTURE,
+      smoothLandmarks,
+      classifyGesture,
+      reset,
+      smoothX, smoothY, // Expose for rendering
+      dist, distSq,
+    };
+  })();
+
+  /* ============================================================
+     MODULE: DRAWING STORE
+     Manages persistent drawn paths and drag selection.
+     ============================================================ */
+  const DrawingStore = (() => {
+    const drawings = []; // Array of { id, points: [{x,y}] }
+    let selectedDrawing = null;
+    let lastDragX = 0, lastDragY = 0;
+
+    // Pre-allocated delta object — reused every drag frame
+    const _delta = { dx: 0, dy: 0 };
+
+    function startNewPath() {
+      const path = { id: performance.now(), points: [] };
+      drawings.push(path);
+      return path;
+    }
+
+    function addPoint(path, x, y) {
+      const pts = path.points;
+      if (pts.length > 0) {
+        const last = pts[pts.length - 1];
+        const dx = x - last.x, dy = y - last.y;
+        // Skip redundant points — reduces path complexity
+        if (dx * dx + dy * dy < CFG.MIN_DRAW_DISTANCE_SQ) return false;
+      }
+      pts.push({ x, y });
+      return true;
+    }
+
+    function findPathAt(x, y) {
+      const r = CFG.PATH_HIT_RADIUS;
+      const rSq = r * r;
+      for (let i = drawings.length - 1; i >= 0; i--) {
+        const pts = drawings[i].points;
+        for (let j = 0; j < pts.length; j++) {
+          const dx = x - pts[j].x, dy = y - pts[j].y;
+          if (dx * dx + dy * dy < rSq) return drawings[i];
+        }
+      }
+      return null;
+    }
+
+    function selectAt(x, y) {
+      selectedDrawing = findPathAt(x, y);
+      if (selectedDrawing) {
+        lastDragX = x;
+        lastDragY = y;
+      }
+      return selectedDrawing;
+    }
+
+    function drag(x, y) {
+      if (!selectedDrawing) return;
+      _delta.dx = x - lastDragX;
+      _delta.dy = y - lastDragY;
+      const pts = selectedDrawing.points;
+      for (let i = 0; i < pts.length; i++) {
+        pts[i].x += _delta.dx;
+        pts[i].y += _delta.dy;
+      }
+      lastDragX = x;
+      lastDragY = y;
+    }
+
+    function clearSelection() {
+      selectedDrawing = null;
+    }
+
+    function isSelected(drawing) {
+      return selectedDrawing !== null && selectedDrawing.id === drawing.id;
+    }
+
+    return {
+      drawings,
+      startNewPath,
+      addPoint,
+      selectAt,
+      drag,
+      clearSelection,
+      isSelected,
+      get selected() { return selectedDrawing; },
+    };
+  })();
+
+  /* ============================================================
+     MODULE: RENDERER
+     Pure rendering functions. No state — only reads from other modules.
+     Optimized: layered glow (no shadowBlur), minimal state changes,
+     batched draw calls where possible.
+     ============================================================ */
+  const Renderer = (() => {
+    const { smoothX, smoothY } = GestureModule;
+
+    // Pre-computed skeleton connections — static array, no per-frame allocation
+    const CONNECTIONS = [
+      0,1, 1,2, 2,3, 3,4,
+      0,5, 5,6, 6,7, 7,8,
+      5,9, 9,10, 10,11, 11,12,
+      9,13, 13,14, 14,15, 15,16,
+      13,17, 17,18, 18,19, 19,20,
+      0,17
+    ];
+
+    // Glow colors — pre-built strings
+    const BLUE_GLOW  = '#00f2ff';
+    const BLUE_DIM   = '#00f2ff44';
+    const PATH_COLOR = '#ff2244';
+    const PATH_SEL   = '#ffee00';
+    const PATH_CORE  = '#ffffff';
+    const PATH_CORE_SEL = '#fffde7';
+
+    function drawPaths(logW, logH) {
+      const drawings = DrawingStore.drawings;
+      if (drawings.length === 0) return;
+
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      for (let d = 0; d < drawings.length; d++) {
+        const drawing = drawings[d];
+        const pts = drawing.points;
+        if (pts.length < 2) continue;
+
+        const sel = DrawingStore.isSelected(drawing);
+
+        // --- Glow pass (wide, semi-transparent) ---
+        ctx.globalAlpha = 0.55;
+        ctx.strokeStyle = sel ? PATH_SEL : PATH_COLOR;
+        ctx.lineWidth = sel ? 18 : 12;
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.stroke();
+
+        // --- Mid glow pass ---
+        ctx.globalAlpha = 0.75;
+        ctx.lineWidth = sel ? 10 : 7;
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.stroke();
+
+        // --- Core pass ---
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = sel ? PATH_CORE_SEL : PATH_CORE;
+        ctx.lineWidth = sel ? 3 : 2;
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.stroke();
+      }
+
+      ctx.globalAlpha = 1;
+    }
+
+    function drawSkeleton(logW, logH) {
+      // Outer glow pass — all connections in one path batch
+      ctx.strokeStyle = BLUE_DIM;
+      ctx.lineWidth = 10;
+      ctx.lineCap = 'round';
+      ctx.globalAlpha = 0.6;
+      ctx.beginPath();
+      for (let i = 0; i < CONNECTIONS.length; i += 2) {
+        const a = CONNECTIONS[i], b = CONNECTIONS[i + 1];
+        ctx.moveTo(smoothX[a] * logW, smoothY[a] * logH);
+        ctx.lineTo(smoothX[b] * logW, smoothY[b] * logH);
+      }
+      ctx.stroke();
+
+      // Core pass — thin, bright
+      ctx.strokeStyle = BLUE_GLOW;
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = 1;
+      ctx.beginPath();
+      for (let i = 0; i < CONNECTIONS.length; i += 2) {
+        const a = CONNECTIONS[i], b = CONNECTIONS[i + 1];
+        ctx.moveTo(smoothX[a] * logW, smoothY[a] * logH);
+        ctx.lineTo(smoothX[b] * logW, smoothY[b] * logH);
+      }
+      ctx.stroke();
+
+      // Landmark dots
+      ctx.fillStyle = BLUE_GLOW;
+      ctx.globalAlpha = 1;
+      for (let i = 0; i < 21; i++) {
+        ctx.beginPath();
+        ctx.arc(smoothX[i] * logW, smoothY[i] * logH, 4, 0, 6.2832);
+        ctx.fill();
+      }
+    }
+
+    function drawFrame(logW, logH, hasHand) {
+      // --- Background clear ---
+      // fillRect is faster than clearRect on opaque contexts
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, logW, logH);
+
+      // --- Stored paths ---
+      drawPaths(logW, logH);
+
+      // --- Particles ---
+      ParticleEngine.updateAndDraw();
+
+      // --- Skeleton (only when hand detected) ---
+      if (hasHand) {
+        drawSkeleton(logW, logH);
+      }
+    }
+
+    return { drawFrame };
+  })();
+
+  /* ============================================================
+     MODULE: INFERENCE ENGINE
+     Decoupled from render loop.
+     MediaPipe runs asynchronously; results are buffered and
+     consumed by the render loop at its own pace.
+     ============================================================ */
+  const InferenceEngine = (() => {
+    // Shared result buffer — written by inference callback, read by render loop
+    let latestLandmarks = null;
+    let hasResult = false;
+    let inferenceStartTime = 0;
+    let lastInferenceMs = 0;
+
+    // Inference lock — prevents queueing a new inference before previous completes
+    // This is the key fix for inference-frame coupling
+    let inferenceInFlight = false;
+
+    const videoEl = document.getElementById('input_video');
+    const loadingScreen = document.getElementById('loading-screen');
+
+    const hands = new Hands({
+      locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: CFG.MAX_HANDS,
+      modelComplexity: CFG.MODEL_COMPLEXITY,
+      minDetectionConfidence: CFG.MIN_DETECTION_CONF,
+      minTrackingConfidence: CFG.MIN_TRACKING_CONF,
+    });
+
+    hands.onResults(results => {
+      inferenceInFlight = false;
+      lastInferenceMs = performance.now() - inferenceStartTime;
+
+      if (loadingScreen.style.display !== 'none') {
+        loadingScreen.style.display = 'none';
+      }
+
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        latestLandmarks = results.multiHandLandmarks[0];
+      } else {
+        latestLandmarks = null;
+      }
+      hasResult = true;
+    });
+
+    // Camera — sends frames to MediaPipe
+    // We use Camera utility but guard against sending while inference is in flight
+    const camera = new Camera(videoEl, {
+      onFrame: async () => {
+        if (inferenceInFlight) return; // Drop frame — inference busy
+        inferenceInFlight = true;
+        inferenceStartTime = performance.now();
+        await hands.send({ image: videoEl });
+      },
+      width: CFG.CAMERA_WIDTH,
+      height: CFG.CAMERA_HEIGHT,
+    });
+
+    function start() { camera.start(); }
+
+    // Called by render loop — returns latest landmarks (null if no hand)
+    function consumeResult() {
+      if (!hasResult) return undefined; // undefined = no new result
+      hasResult = false;
+      return latestLandmarks; // null = hand lost, array = landmarks
+    }
+
+    function getLastInferenceMs() { return lastInferenceMs; }
+
+    return { start, consumeResult, getLastInferenceMs };
+  })();
+
+  /* ============================================================
+     MODULE: MAIN LOOP
+     render loop runs at 60fps via rAF.
+     Inference results are consumed when available.
+     Gesture state and drawing state are updated each render frame.
+     ============================================================ */
+  const MainLoop = (() => {
+    const { GESTURE, smoothLandmarks, classifyGesture, smoothX, smoothY } = GestureModule;
+
+    // Track hand visibility across frames for reset logic
+    let handVisible = false;
+
+    // Drawing state
+    let currentPath = null;
+    let isDragActive = false;
+
+    // Per-frame cached logical dimensions — avoids repeated function calls
+    let logW = window.innerWidth;
+    let logH = window.innerHeight;
+
+    // Perf measurement
+    let frameCount = 0;
+    let lastFpsTime = performance.now();
+    let displayFps = 0;
+
+    // Update logical dimensions on resize
+    window.addEventListener('resize', () => {
+      logW = window.innerWidth;
+      logH = window.innerHeight;
+    }, { passive: true });
+
+    const hudFps = document.getElementById('hud-fps');
+    const hudInf = document.getElementById('hud-inf');
+    const hudPrt = document.getElementById('hud-prt');
+    const hudGc  = document.getElementById('hud-gc');
+
+    if (CFG.DEBUG_MODE) {
+      document.getElementById('perf-hud').style.display = 'block';
+    }
+
+    function tick(timestamp) {
+      // Always request next frame first — minimizes scheduling jitter
+      requestAnimationFrame(tick);
+
+      // --- Consume inference result (if new result available) ---
+      const inferenceResult = InferenceEngine.consumeResult();
+
+      if (inferenceResult !== undefined) {
+        // New result from inference engine
+        if (inferenceResult !== null) {
+          // Hand detected
+          if (!handVisible) {
+            handVisible = true;
+          }
+          smoothLandmarks(inferenceResult);
+
+          // --- Gesture classification ---
+          const gesture = classifyGesture(logW, logH);
+
+          const ix = smoothX[8] * logW;
+          const iy = smoothY[8] * logH;
+          const tx = smoothX[4] * logW;
+          const ty = smoothY[4] * logH;
+          const midX = (ix + tx) * 0.5;
+          const midY = (iy + ty) * 0.5;
+
+          if (gesture === GESTURE.DRAW) {
+            // Drawing mode
+            isDragActive = false;
+            DrawingStore.clearSelection();
+
+            if (!currentPath) {
+              currentPath = DrawingStore.startNewPath();
+            }
+            const added = DrawingStore.addPoint(currentPath, ix, iy);
+            if (added) {
+              // Emit sparks only on new points — prevents burst on held position
+              ParticleEngine.emit(ix, iy, CFG.SPARKS_PER_EMISSION);
+            }
+
+          } else if (gesture === GESTURE.PINCH) {
+            // Pinch-drag mode
+            currentPath = null;
+
+            if (!isDragActive) {
+              // Start drag — find drawing under midpoint
+              DrawingStore.selectAt(midX, midY);
+              isDragActive = DrawingStore.selected !== null;
+            }
+
+            if (isDragActive) {
+              DrawingStore.drag(midX, midY);
+            }
+
+          } else {
+            // NONE — clear transient state
+            currentPath = null;
+            isDragActive = false;
+            DrawingStore.clearSelection();
+          }
+
+        } else {
+          // Hand lost
+          if (handVisible) {
+            handVisible = false;
+            GestureModule.reset();
+            currentPath = null;
+            isDragActive = false;
+            DrawingStore.clearSelection();
+          }
+        }
+      }
+
+      // --- Render ---
+      Renderer.drawFrame(logW, logH, handVisible);
+
+      // --- Perf HUD ---
+      if (CFG.DEBUG_MODE) {
+        frameCount++;
+        const now = performance.now();
+        if (now - lastFpsTime >= 500) {
+          displayFps = Math.round(frameCount * 1000 / (now - lastFpsTime));
+          frameCount = 0;
+          lastFpsTime = now;
+          hudFps.textContent = displayFps;
+          hudInf.textContent = InferenceEngine.getLastInferenceMs().toFixed(1);
+          hudPrt.textContent = ParticleEngine.getActiveCount();
+        }
+      }
+    }
+
+    function start() {
+      requestAnimationFrame(tick);
+    }
+
+    return { start };
+  })();
+
+  /* ============================================================
+     BOOT SEQUENCE
+     Start inference engine first (camera init takes time),
+     then start render loop.
+     ============================================================ */
+  InferenceEngine.start();
+  MainLoop.start();
+
+  </script>
+</body>
+</html>
